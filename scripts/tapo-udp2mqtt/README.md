@@ -1,114 +1,182 @@
 # tapo-udp2mqtt
 
-Listen for UDP broadcast packets from Tapo video doorbells (e.g. D235) and translate them into MQTT pulses.
+Receive **Tapo video doorbell ring events** via local UDP broadcast and forward them as an **MQTT pulse**.
 
-This tool was created to integrate Tapo doorbells into custom home‑automation setups
-(ioBroker, Node‑RED, Home Assistant, custom MQTT consumers) **without any cloud dependency**.
+This tool listens for a **binary UDP broadcast on port 20005** sent by Tapo video doorbells
+(e.g. **D235**, very likely others) **when the ring button is pressed**, and translates this
+event into an MQTT message (`"1"` followed by `"0"` after 500 ms).
 
----
-
-## What it does
-
-- Listens on a UDP port (default: **20005** or **25005**, depending on model)
-- Accepts **broadcast packets only**
-- Performs basic sanity checks:
-  - minimum packet length
-  - source IP filtering (optional)
-- When a valid packet is received:
-  - publishes MQTT value `1`
-  - waits a short delay (default: 500 ms)
-  - publishes MQTT value `0`
-
-This produces a clean **momentary MQTT trigger** suitable for automations.
+> ⚠️ **Important**
+> - The correct UDP port is **20005**
+> - Earlier references to `25005` are wrong
+> - The UDP payload is opaque binary data — only presence, length and source IP are used
 
 ---
 
-## Why this works
+## How it works
 
-Tapo doorbells send a **UDP broadcast packet** when the physical ring button is pressed.
-The packet payload is binary and undocumented, but:
+- Tapo doorbells emit a **UDP broadcast to port 20005** on ring button press
+- Payload is encrypted / undocumented binary data
+- Observed properties:
+  - Broadcast packet
+  - Always sent on button press
+  - Not sent for motion or other events
 
-- it is only sent on button press
-- it is broadcast
-- it has a consistent minimum length
+This script:
 
-So the **existence** of the packet is sufficient as a trigger.
+1. Binds a UDP socket (default `0.0.0.0:20005`, configurable)
+2. Filters packets by:
+   - Minimum packet length
+   - Source IP prefix (useful for VLANs)
+   - Debounce window
+3. Publishes an MQTT pulse:
+   - `topic = "1"`
+   - wait 500 ms
+   - `topic = "0"`
 
 ---
 
 ## Requirements
 
-- Lua 5.1+
-- LuaSocket
-- Lua MQTT library (mosquitto or compatible)
-- Network access to the doorbell VLAN
-- Plain MQTT (no TLS)
+- Lua 5.1 or newer
+- LuaSocket (`luasocket`)
+- Plain MQTT broker (Mosquitto, no TLS)
+
+### Install LuaSocket (Debian / Ubuntu)
+
+```bash
+sudo apt install lua-socket
+```
 
 ---
 
 ## Usage
 
 ```bash
-lua tapo-udp2mqtt.lua \
-  --mqtt 192.168.1.10[:1883] \
-  --topic house/doorbell/front \
-  [--udp-port 20005] \
-  [--minlen 20] \
-  [--source 192.168.4.] \
-  [--pulse-ms 500]
+lua tapo-udp2mqtt.lua <mqtt_host> <mqtt_topic> [mqtt_port] [udp_port] [min_len] [allowed_prefix] [debounce_s] [bind_ip]
 ```
+
+> Note: If your script version expects `bind_ip` earlier in the argument list, keep your local script and README in sync.
+> The intent is: **bind address is configurable** (default `0.0.0.0`).
 
 ---
 
 ## Parameters
 
-| Parameter | Description |
-|---------|-------------|
-| `--mqtt` | MQTT broker IP or IP:port |
-| `--topic` | MQTT topic to publish |
-| `--udp-port` | UDP listen port (default: 20005) |
-| `--minlen` | Minimum UDP packet length |
-| `--source` | Optional source IP prefix filter |
-| `--pulse-ms` | Pulse duration in milliseconds |
+| Parameter | Default | Description |
+|---------|--------|-------------|
+| `mqtt_host` | — | MQTT broker IP or hostname |
+| `mqtt_topic` | — | Topic to publish pulse to |
+| `mqtt_port` | `1883` | MQTT TCP port |
+| `udp_port` | `20005` | **Tapo doorbell UDP port** |
+| `min_len` | `24` | Drop packets shorter than this |
+| `allowed_prefix` | `192.168.4.` | Source IP prefix filter |
+| `debounce_s` | `1.0` | Ignore repeated presses inside this window |
+| `bind_ip` | `0.0.0.0` | Local bind address for UDP socket |
+
+### When would you use `bind_ip`?
+
+Normally `0.0.0.0` is correct (listen on all interfaces, including VLANs).
+
+You might set `bind_ip` if you want to **restrict** listening to a single interface address, e.g.:
+
+- `192.168.4.10` to listen only on the VLAN IP
+- `127.0.0.1` (usually not useful here)
 
 ---
 
-## MQTT behaviour
+## Example
 
-On valid UDP packet:
-```
-topic = 1
-(wait)
-topic = 0
-```
-
-No retained messages.
-QoS 0.
-
----
-
-## Testing UDP manually
+Listen on all interfaces (recommended):
 
 ```bash
-echo test | nc -u -b 255.255.255.255 20005
+lua tapo-udp2mqtt.lua 192.168.66.10 tapo/doorbell 1883 20005 24 192.168.4. 1.0 0.0.0.0
+```
+
+Restrict to VLAN IP only:
+
+```bash
+lua tapo-udp2mqtt.lua 192.168.66.10 tapo/doorbell 1883 20005 24 192.168.4. 1.0 192.168.4.10
 ```
 
 ---
 
-## Security notes
+## MQTT behavior
 
-- UDP is unauthenticated
-- Use VLAN separation
-- Source IP filtering recommended
+On a valid doorbell press:
+
+```
+tapo/doorbell 1
+(wait 500 ms)
+tapo/doorbell 0
+```
+
+This pulse-style signaling works well for:
+- ioBroker
+- Home Assistant
+- Node-RED
+- Grafana / alerts
+- Any edge-triggered automation
+
+---
+
+## VLAN & broadcast notes
+
+- UDP broadcast arrives on the **Layer-2 network/VLAN** where the doorbell resides
+- Linux receives broadcasts on all interfaces bound to `0.0.0.0`
+- Routers **do not forward broadcasts** by default
+
+Ensure:
+- Listener is on the same VLAN **or**
+- A broadcast helper / relay is configured
+
+---
+
+## Debugging
+
+### Verify UDP packets
+
+```bash
+nc -lu 20005
+```
+
+or
+
+```bash
+sudo tcpdump -ni any udp port 20005
+```
+
+If you see binary garbage when pressing the button, the script will work.
+
+---
+
+## Common mistakes
+
+| Symptom | Cause |
+|------|------|
+| Script silent | Wrong port (25005 instead of **20005**) |
+| `nc` works but script doesn't | IP prefix filter mismatch, or bound to wrong `bind_ip` |
+| Only triggers once | Debounce time too long |
+| MQTT publish fails | Broker closed idle connection |
+
+---
+
+## Why MQTT pulse instead of JSON?
+
+- Stateless
+- Easy edge detection
+- No retained garbage
+- Works with nearly every automation stack
 
 ---
 
 ## License
 
-MIT License
+MIT License — do whatever you want, attribution appreciated.
 
 ---
 
 ## Author
 
-Johannes Rietschel
+Johannes Rietschel  
+Real-world automation, energy & embedded systems
